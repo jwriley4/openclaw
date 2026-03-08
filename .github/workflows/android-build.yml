@@ -49,10 +49,6 @@ jobs:
         path: |
           ~/.gradle/caches
           ~/.gradle/wrapper
-          apps/android
-          apps/shared/.gradle/caches
-          apps/android
-          apps/shared/.gradle/wrapper
         key: ${{ runner.os }}-gradle-${{ hashFiles('apps/android/**/*.gradle*', 'apps/android/**/gradle-wrapper.properties') }}
         restore-keys: |
           ${{ runner.os }}-gradle-
@@ -66,23 +62,28 @@ jobs:
         ./gradlew lint --stacktrace
       continue-on-error: true
 
+    - name: Resolve build mode
+      id: build-mode
+      run: |
+        if [ "${{ github.event_name }}" = "release" ]; then
+          echo "build_type=release" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=:app:assembleRelease" >> "$GITHUB_OUTPUT"
+          echo "name_suffix=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "build_type=debug" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=:app:assembleDebug" >> "$GITHUB_OUTPUT"
+          echo "name_suffix=$(echo "${{ github.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Build APK
       run: |
         cd apps/android
-        if [ "${{ github.event_name }}" = "release" ]; then
-          ./gradlew :app:assembleRelease --stacktrace
-        else
-          ./gradlew :app:assembleDebug --stacktrace
-        fi
+        ./gradlew "${{ steps.build-mode.outputs.gradle_task }}" --stacktrace
 
     - name: Find APK file
       id: find-apk
       run: |
-        if [ "${{ github.event_name }}" = "release" ]; then
-          APK_PATH=$(find apps/android/app/build/outputs/apk/release -name "*.apk" | head -n1)
-        else
-          APK_PATH=$(find apps/android/app/build/outputs/apk/debug -name "*.apk" | head -n1)
-        fi
+        APK_PATH=$(find "apps/android/app/build/outputs/apk/${{ steps.build-mode.outputs.build_type }}" -name "*.apk" | head -n1)
         if [ -z "$APK_PATH" ]; then
           echo "::error::APK not found after build"
           ls -laR apps/android/app/build/outputs/apk/ 2>/dev/null || echo "No APK output directory"
@@ -91,16 +92,48 @@ jobs:
         # Rename with git SHA for traceability
         APK_DIR=$(dirname "$APK_PATH")
         APK_EXT="${APK_PATH##*.}"
-        SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-        if [ "${{ github.event_name }}" = "release" ]; then
-          NEW_NAME="openclaw-android-${{ github.event.release.tag_name }}.${APK_EXT}"
-        else
-          NEW_NAME="openclaw-android-${SHORT_SHA}.${APK_EXT}"
-        fi
+        NEW_NAME="openclaw-android-${{ steps.build-mode.outputs.name_suffix }}.${APK_EXT}"
         cp "$APK_PATH" "${APK_DIR}/${NEW_NAME}"
         echo "apk-path=${APK_DIR}/${NEW_NAME}" >> $GITHUB_OUTPUT
         echo "apk-name=${NEW_NAME}" >> $GITHUB_OUTPUT
         echo "Found APK: $APK_PATH → renamed to $NEW_NAME"
+
+    - name: Sign + verify release APK (optional secrets, automatic fallback)
+      if: github.event_name == 'release'
+      id: sign-release
+      env:
+        ANDROID_SIGNING_KEYSTORE_B64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_B64 }}
+        ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+        ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+        ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+      run: |
+        set -euo pipefail
+        APK="${{ steps.find-apk.outputs.apk-path }}"
+        OUT_APK="$RUNNER_TEMP/signed.apk"
+        ANY_SIGNING_INPUT="${ANDROID_SIGNING_KEYSTORE_B64}${ANDROID_SIGNING_STORE_PASSWORD}${ANDROID_SIGNING_KEY_ALIAS}${ANDROID_SIGNING_KEY_PASSWORD}"
+        if [ -n "$ANY_SIGNING_INPUT" ]; then
+          if [ -z "$ANDROID_SIGNING_KEYSTORE_B64" ] || [ -z "$ANDROID_SIGNING_STORE_PASSWORD" ] || [ -z "$ANDROID_SIGNING_KEY_ALIAS" ]; then
+            echo "::error::Set either all required signing secrets (ANDROID_SIGNING_KEYSTORE_B64, ANDROID_SIGNING_STORE_PASSWORD, ANDROID_SIGNING_KEY_ALIAS) or none."
+            exit 1
+          fi
+          KEYSTORE_PATH="$RUNNER_TEMP/release.keystore"
+          KEY_PASSWORD="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_STORE_PASSWORD}"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
+          apksigner sign --out "$OUT_APK" \
+            --ks "$KEYSTORE_PATH" \
+            --ks-pass "pass:$ANDROID_SIGNING_STORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_SIGNING_KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            "$APK"
+          echo "mode=custom-keystore" >> "$GITHUB_OUTPUT"
+        else
+          DEBUG_KS="$RUNNER_TEMP/debug.keystore"
+          keytool -genkeypair -v -keystore "$DEBUG_KS" -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+          apksigner sign --out "$OUT_APK" --ks "$DEBUG_KS" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android "$APK"
+          echo "mode=auto-debug-keystore" >> "$GITHUB_OUTPUT"
+        fi
+        mv -f "$OUT_APK" "$APK"
+        apksigner verify --verbose --print-certs "$APK"
 
     - name: Generate checksum
       run: |
@@ -138,6 +171,7 @@ jobs:
         echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
         if [ "${{ github.event_name }}" = "release" ]; then
           echo "- **Release:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Signing mode:** ${{ steps.sign-release.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Action:** Attached to release" >> $GITHUB_STEP_SUMMARY
         elif [ "${{ github.event_name }}" = "pull_request" ]; then
           echo "- **PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
