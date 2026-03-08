@@ -12,7 +12,7 @@ on:
       - 'apps/android/**'
       - 'apps/shared/OpenClawKit/**'
   release:
-    types: [created]
+    types: [published]
 
 permissions:
   contents: write
@@ -66,15 +66,23 @@ jobs:
         ./gradlew lint --stacktrace
       continue-on-error: true
 
-    - name: Build debug APK
+    - name: Build APK
       run: |
         cd apps/android
-        ./gradlew :app:assembleDebug --stacktrace
+        if [ "${{ github.event_name }}" = "release" ]; then
+          ./gradlew :app:assembleRelease --stacktrace
+        else
+          ./gradlew :app:assembleDebug --stacktrace
+        fi
 
     - name: Find APK file
       id: find-apk
       run: |
-        APK_PATH=$(find apps/android/app/build/outputs/apk/debug -name "*.apk" | head -n1)
+        if [ "${{ github.event_name }}" = "release" ]; then
+          APK_PATH=$(find apps/android/app/build/outputs/apk/release -name "*.apk" | head -n1)
+        else
+          APK_PATH=$(find apps/android/app/build/outputs/apk/debug -name "*.apk" | head -n1)
+        fi
         if [ -z "$APK_PATH" ]; then
           echo "::error::APK not found after build"
           ls -laR apps/android/app/build/outputs/apk/ 2>/dev/null || echo "No APK output directory"
@@ -94,6 +102,13 @@ jobs:
         echo "apk-name=${NEW_NAME}" >> $GITHUB_OUTPUT
         echo "Found APK: $APK_PATH → renamed to $NEW_NAME"
 
+    - name: Generate checksum
+      run: |
+        SHA_PATH="${{ steps.find-apk.outputs.apk-path }}.sha256"
+        sha256sum "${{ steps.find-apk.outputs.apk-path }}" > "$SHA_PATH"
+        echo "sha-path=$SHA_PATH" >> $GITHUB_OUTPUT
+      id: checksum
+
     - name: Upload APK as artifact (on push/PR)
       if: github.event_name != 'release'
       uses: actions/upload-artifact@v4
@@ -106,7 +121,9 @@ jobs:
       if: github.event_name == 'release'
       uses: softprops/action-gh-release@v2
       with:
-        files: ${{ steps.find-apk.outputs.apk-path }}
+        files: |
+          ${{ steps.find-apk.outputs.apk-path }}
+          ${{ steps.checksum.outputs.sha-path }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -129,4 +146,8 @@ jobs:
           echo "- **Action:** Uploaded as workflow artifact (30-day retention)" >> $GITHUB_STEP_SUMMARY
         fi
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "> ⚠️ This is a **debug** build. Release-signed APKs for production distribution are a planned follow-up." >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event_name }}" = "release" ]; then
+          echo "> ℹ️ Release builds upload a **release** APK asset." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "> ⚠️ Push/PR builds upload a **debug** APK artifact." >> $GITHUB_STEP_SUMMARY
+        fi
