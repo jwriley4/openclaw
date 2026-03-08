@@ -1,0 +1,188 @@
+name: Android Build Core
+
+on:
+  workflow_call:
+    inputs:
+      build_type:
+        description: debug or release
+        required: true
+        type: string
+      publish_release_asset:
+        description: attach APK + checksum to a GitHub release
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: release tag when publish_release_asset is true
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: artifact name when publishing workflow artifacts
+        required: false
+        type: string
+        default: openclaw-android-debug
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          apps/android
+          apps/shared
+        sparse-checkout-cone-mode: true
+
+    - name: Set up JDK 17 (Temurin)
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Cache Gradle packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('apps/android/**/*.gradle*', 'apps/android/**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x apps/android/gradlew
+
+    - name: Lint check
+      run: |
+        cd apps/android
+        ./gradlew lint --stacktrace
+      continue-on-error: true
+
+    - name: Resolve build settings
+      id: cfg
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.build_type }}" = "release" ]; then
+          echo "output_dir=release" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=:app:assembleRelease" >> "$GITHUB_OUTPUT"
+          suffix="${{ inputs.release_tag }}"
+          if [ -z "$suffix" ]; then suffix="$(echo "${GITHUB_SHA}" | cut -c1-7)"; fi
+        else
+          echo "output_dir=debug" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=:app:assembleDebug" >> "$GITHUB_OUTPUT"
+          suffix="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+        fi
+        echo "name_suffix=$suffix" >> "$GITHUB_OUTPUT"
+
+    - name: Build APK
+      run: |
+        cd apps/android
+        ./gradlew "${{ steps.cfg.outputs.gradle_task }}" --stacktrace
+
+    - name: Find APK file
+      id: apk
+      run: |
+        set -euo pipefail
+        APK_PATH=$(find "apps/android/app/build/outputs/apk/${{ steps.cfg.outputs.output_dir }}" -name "*.apk" | head -n1)
+        if [ -z "$APK_PATH" ]; then
+          echo "::error::APK not found after build"
+          ls -laR apps/android/app/build/outputs/apk/ 2>/dev/null || echo "No APK output directory"
+          exit 1
+        fi
+        APK_DIR=$(dirname "$APK_PATH")
+        APK_EXT="${APK_PATH##*.}"
+        APK_NAME="openclaw-android-${{ steps.cfg.outputs.name_suffix }}.${APK_EXT}"
+        cp "$APK_PATH" "${APK_DIR}/${APK_NAME}"
+        echo "apk_path=${APK_DIR}/${APK_NAME}" >> "$GITHUB_OUTPUT"
+        echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+
+    - name: Sign + verify release APK (optional secrets, automatic fallback)
+      if: inputs.build_type == 'release'
+      id: sign
+      env:
+        ANDROID_SIGNING_KEYSTORE_B64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_B64 }}
+        ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+        ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+        ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+      run: |
+        set -euo pipefail
+        APK="${{ steps.apk.outputs.apk_path }}"
+        OUT_APK="$RUNNER_TEMP/signed.apk"
+        ANY_SIGNING_INPUT="${ANDROID_SIGNING_KEYSTORE_B64}${ANDROID_SIGNING_STORE_PASSWORD}${ANDROID_SIGNING_KEY_ALIAS}${ANDROID_SIGNING_KEY_PASSWORD}"
+        if [ -n "$ANY_SIGNING_INPUT" ]; then
+          if [ -z "$ANDROID_SIGNING_KEYSTORE_B64" ] || [ -z "$ANDROID_SIGNING_STORE_PASSWORD" ] || [ -z "$ANDROID_SIGNING_KEY_ALIAS" ]; then
+            echo "::error::Set either all required signing secrets (ANDROID_SIGNING_KEYSTORE_B64, ANDROID_SIGNING_STORE_PASSWORD, ANDROID_SIGNING_KEY_ALIAS) or none."
+            exit 1
+          fi
+          KEYSTORE_PATH="$RUNNER_TEMP/release.keystore"
+          KEY_PASSWORD="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_STORE_PASSWORD}"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
+          apksigner sign --out "$OUT_APK" \
+            --ks "$KEYSTORE_PATH" \
+            --ks-pass "pass:$ANDROID_SIGNING_STORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_SIGNING_KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            "$APK"
+          echo "mode=custom-keystore" >> "$GITHUB_OUTPUT"
+        else
+          DEBUG_KS="$RUNNER_TEMP/debug.keystore"
+          keytool -genkeypair -v -keystore "$DEBUG_KS" -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+          apksigner sign --out "$OUT_APK" --ks "$DEBUG_KS" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android "$APK"
+          echo "mode=auto-debug-keystore" >> "$GITHUB_OUTPUT"
+        fi
+        mv -f "$OUT_APK" "$APK"
+        apksigner verify --verbose --print-certs "$APK"
+
+    - name: Generate checksum
+      id: checksum
+      run: |
+        set -euo pipefail
+        SHA_PATH="${{ steps.apk.outputs.apk_path }}.sha256"
+        sha256sum "${{ steps.apk.outputs.apk_path }}" > "$SHA_PATH"
+        echo "sha_path=$SHA_PATH" >> "$GITHUB_OUTPUT"
+
+    - name: Validate release tag
+      if: inputs.publish_release_asset
+      run: |
+        if [ -z "${{ inputs.release_tag }}" ]; then
+          echo "::error::release_tag is required when publish_release_asset=true"
+          exit 1
+        fi
+
+    - name: Upload APK as artifact
+      if: ${{ !inputs.publish_release_asset }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ steps.apk.outputs.apk_path }}
+        retention-days: 30
+
+    - name: Attach APK to release
+      if: inputs.publish_release_asset
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.release_tag }}
+        files: |
+          ${{ steps.apk.outputs.apk_path }}
+          ${{ steps.checksum.outputs.sha_path }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build summary
+      run: |
+        APK_SIZE=$(du -h "${{ steps.apk.outputs.apk_path }}" | cut -f1)
+        echo "## Android Build Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "- APK: \`${{ steps.apk.outputs.apk_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Build type: ${{ inputs.build_type }}" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Size: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${{ inputs.build_type }}" = "release" ]; then
+          echo "- Signing mode: ${{ steps.sign.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+        fi

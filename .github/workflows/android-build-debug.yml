@@ -1,0 +1,30 @@
+name: Android Build (Debug)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/android/**"
+      - "apps/shared/OpenClawKit/**"
+  pull_request:
+    paths:
+      - "apps/android/**"
+      - "apps/shared/OpenClawKit/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    uses: ./.github/workflows/android-build-core.yml
+    with:
+      build_type: debug
+      publish_release_asset: false
+      artifact_name: openclaw-android-debug
+    secrets: inherit
