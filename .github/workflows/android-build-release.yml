@@ -4,6 +4,17 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      publish_release_asset:
+        description: "Attach assets to an existing GitHub Release tag"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "Release tag (required only when publish_release_asset=true)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -14,9 +25,10 @@ concurrency:
 
 jobs:
   release:
-    uses: ./.github/workflows/android-build-reusable.yml
+    uses: ./.github/workflows/android-build-core.yml
     with:
       build_type: release
-      publish_release_asset: true
-      release_tag: ${{ github.event.release.tag_name }}
+      publish_release_asset: ${{ github.event_name == 'release' || inputs.publish_release_asset }}
+      release_tag: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+      artifact_name: openclaw-android-release
     secrets: inherit

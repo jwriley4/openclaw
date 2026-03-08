@@ -11,6 +11,7 @@ on:
     paths:
       - "apps/android/**"
       - "apps/shared/OpenClawKit/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ concurrency:
 
 jobs:
   debug:
-    uses: ./.github/workflows/android-build-reusable.yml
+    uses: ./.github/workflows/android-build-core.yml
     with:
       build_type: debug
       publish_release_asset: false

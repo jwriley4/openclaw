@@ -1,4 +1,4 @@
-name: Android Build Reusable
+name: Android Build Core
 
 on:
   workflow_call:
@@ -146,6 +146,14 @@ jobs:
         SHA_PATH="${{ steps.apk.outputs.apk_path }}.sha256"
         sha256sum "${{ steps.apk.outputs.apk_path }}" > "$SHA_PATH"
         echo "sha_path=$SHA_PATH" >> "$GITHUB_OUTPUT"
+
+    - name: Validate release tag
+      if: inputs.publish_release_asset
+      run: |
+        if [ -z "${{ inputs.release_tag }}" ]; then
+          echo "::error::release_tag is required when publish_release_asset=true"
+          exit 1
+        fi
 
     - name: Upload APK as artifact
       if: ${{ !inputs.publish_release_asset }}
