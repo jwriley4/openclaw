@@ -1,0 +1,22 @@
+name: Android Build (Release)
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    uses: ./.github/workflows/android-build-reusable.yml
+    with:
+      build_type: release
+      publish_release_asset: true
+      release_tag: ${{ github.event.release.tag_name }}
+    secrets: inherit

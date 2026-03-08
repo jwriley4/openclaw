@@ -1,25 +1,27 @@
-name: Android Build
+name: Android Build Reusable
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'apps/android/**'
-      - 'apps/shared/OpenClawKit/**'
-  pull_request:
-    paths:
-      - 'apps/android/**'
-      - 'apps/shared/OpenClawKit/**'
-  release:
-    types: [published]
-
-permissions:
-  contents: write
-
-concurrency:
-  group: android-build-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      build_type:
+        description: debug or release
+        required: true
+        type: string
+      publish_release_asset:
+        description: attach APK + checksum to a GitHub release
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: release tag when publish_release_asset is true
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: artifact name when publishing workflow artifacts
+        required: false
+        type: string
+        default: openclaw-android-debug
 
 jobs:
   build-android:
@@ -62,45 +64,47 @@ jobs:
         ./gradlew lint --stacktrace
       continue-on-error: true
 
-    - name: Resolve build mode
-      id: build-mode
+    - name: Resolve build settings
+      id: cfg
       run: |
-        if [ "${{ github.event_name }}" = "release" ]; then
-          echo "build_type=release" >> "$GITHUB_OUTPUT"
+        set -euo pipefail
+        if [ "${{ inputs.build_type }}" = "release" ]; then
+          echo "output_dir=release" >> "$GITHUB_OUTPUT"
           echo "gradle_task=:app:assembleRelease" >> "$GITHUB_OUTPUT"
-          echo "name_suffix=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          suffix="${{ inputs.release_tag }}"
+          if [ -z "$suffix" ]; then suffix="$(echo "${GITHUB_SHA}" | cut -c1-7)"; fi
         else
-          echo "build_type=debug" >> "$GITHUB_OUTPUT"
+          echo "output_dir=debug" >> "$GITHUB_OUTPUT"
           echo "gradle_task=:app:assembleDebug" >> "$GITHUB_OUTPUT"
-          echo "name_suffix=$(echo "${{ github.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          suffix="$(echo "${GITHUB_SHA}" | cut -c1-7)"
         fi
+        echo "name_suffix=$suffix" >> "$GITHUB_OUTPUT"
 
     - name: Build APK
       run: |
         cd apps/android
-        ./gradlew "${{ steps.build-mode.outputs.gradle_task }}" --stacktrace
+        ./gradlew "${{ steps.cfg.outputs.gradle_task }}" --stacktrace
 
     - name: Find APK file
-      id: find-apk
+      id: apk
       run: |
-        APK_PATH=$(find "apps/android/app/build/outputs/apk/${{ steps.build-mode.outputs.build_type }}" -name "*.apk" | head -n1)
+        set -euo pipefail
+        APK_PATH=$(find "apps/android/app/build/outputs/apk/${{ steps.cfg.outputs.output_dir }}" -name "*.apk" | head -n1)
         if [ -z "$APK_PATH" ]; then
           echo "::error::APK not found after build"
           ls -laR apps/android/app/build/outputs/apk/ 2>/dev/null || echo "No APK output directory"
           exit 1
         fi
-        # Rename with git SHA for traceability
         APK_DIR=$(dirname "$APK_PATH")
         APK_EXT="${APK_PATH##*.}"
-        NEW_NAME="openclaw-android-${{ steps.build-mode.outputs.name_suffix }}.${APK_EXT}"
-        cp "$APK_PATH" "${APK_DIR}/${NEW_NAME}"
-        echo "apk-path=${APK_DIR}/${NEW_NAME}" >> $GITHUB_OUTPUT
-        echo "apk-name=${NEW_NAME}" >> $GITHUB_OUTPUT
-        echo "Found APK: $APK_PATH → renamed to $NEW_NAME"
+        APK_NAME="openclaw-android-${{ steps.cfg.outputs.name_suffix }}.${APK_EXT}"
+        cp "$APK_PATH" "${APK_DIR}/${APK_NAME}"
+        echo "apk_path=${APK_DIR}/${APK_NAME}" >> "$GITHUB_OUTPUT"
+        echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
 
     - name: Sign + verify release APK (optional secrets, automatic fallback)
-      if: github.event_name == 'release'
-      id: sign-release
+      if: inputs.build_type == 'release'
+      id: sign
       env:
         ANDROID_SIGNING_KEYSTORE_B64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_B64 }}
         ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
@@ -108,7 +112,7 @@ jobs:
         ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
       run: |
         set -euo pipefail
-        APK="${{ steps.find-apk.outputs.apk-path }}"
+        APK="${{ steps.apk.outputs.apk_path }}"
         OUT_APK="$RUNNER_TEMP/signed.apk"
         ANY_SIGNING_INPUT="${ANDROID_SIGNING_KEYSTORE_B64}${ANDROID_SIGNING_STORE_PASSWORD}${ANDROID_SIGNING_KEY_ALIAS}${ANDROID_SIGNING_KEY_PASSWORD}"
         if [ -n "$ANY_SIGNING_INPUT" ]; then
@@ -136,52 +140,41 @@ jobs:
         apksigner verify --verbose --print-certs "$APK"
 
     - name: Generate checksum
-      run: |
-        SHA_PATH="${{ steps.find-apk.outputs.apk-path }}.sha256"
-        sha256sum "${{ steps.find-apk.outputs.apk-path }}" > "$SHA_PATH"
-        echo "sha-path=$SHA_PATH" >> $GITHUB_OUTPUT
       id: checksum
+      run: |
+        set -euo pipefail
+        SHA_PATH="${{ steps.apk.outputs.apk_path }}.sha256"
+        sha256sum "${{ steps.apk.outputs.apk_path }}" > "$SHA_PATH"
+        echo "sha_path=$SHA_PATH" >> "$GITHUB_OUTPUT"
 
-    - name: Upload APK as artifact (on push/PR)
-      if: github.event_name != 'release'
+    - name: Upload APK as artifact
+      if: ${{ !inputs.publish_release_asset }}
       uses: actions/upload-artifact@v4
       with:
-        name: openclaw-android-debug
-        path: ${{ steps.find-apk.outputs.apk-path }}
+        name: ${{ inputs.artifact_name }}
+        path: ${{ steps.apk.outputs.apk_path }}
         retention-days: 30
 
     - name: Attach APK to release
-      if: github.event_name == 'release'
+      if: inputs.publish_release_asset
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ inputs.release_tag }}
         files: |
-          ${{ steps.find-apk.outputs.apk-path }}
-          ${{ steps.checksum.outputs.sha-path }}
+          ${{ steps.apk.outputs.apk_path }}
+          ${{ steps.checksum.outputs.sha_path }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build summary
       run: |
-        APK_SIZE=$(du -h "${{ steps.find-apk.outputs.apk-path }}" | cut -f1)
-        echo "## 🤖 Android Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "- **APK:** \`${{ steps.find-apk.outputs.apk-name }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Size:** $APK_SIZE" >> $GITHUB_STEP_SUMMARY
-        echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-        if [ "${{ github.event_name }}" = "release" ]; then
-          echo "- **Release:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Signing mode:** ${{ steps.sign-release.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Action:** Attached to release" >> $GITHUB_STEP_SUMMARY
-        elif [ "${{ github.event_name }}" = "pull_request" ]; then
-          echo "- **PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Action:** Uploaded as workflow artifact (30-day retention)" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "- **Action:** Uploaded as workflow artifact (30-day retention)" >> $GITHUB_STEP_SUMMARY
-        fi
-        echo "" >> $GITHUB_STEP_SUMMARY
-        if [ "${{ github.event_name }}" = "release" ]; then
-          echo "> ℹ️ Release builds upload a **release** APK asset." >> $GITHUB_STEP_SUMMARY
-        else
-          echo "> ⚠️ Push/PR builds upload a **debug** APK artifact." >> $GITHUB_STEP_SUMMARY
+        APK_SIZE=$(du -h "${{ steps.apk.outputs.apk_path }}" | cut -f1)
+        echo "## Android Build Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "- APK: \`${{ steps.apk.outputs.apk_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Build type: ${{ inputs.build_type }}" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Size: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${{ inputs.build_type }}" = "release" ]; then
+          echo "- Signing mode: ${{ steps.sign.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
         fi
